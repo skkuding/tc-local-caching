@@ -290,12 +290,7 @@ func writeReceipt(root string, reserve func(int64) error) error {
 	return os.WriteFile(filepath.Join(root, ".receipt.json"), data, 0600)
 }
 func readReceipt(root string) ([]receiptFile, error) {
-	raw, err := os.Open(filepath.Join(root, ".receipt.json"))
-	if err != nil {
-		return nil, err
-	}
-	data, err := io.ReadAll(io.LimitReader(raw, 1<<20))
-	err = errors.Join(err, raw.Close())
+	data, err := readBoundedCacheFile(filepath.Join(root, ".receipt.json"), 1<<20)
 	if err != nil {
 		return nil, err
 	}
@@ -315,7 +310,7 @@ func readReceipt(root string) ([]receiptFile, error) {
 		if !fs.ValidPath(saved.Name) || saved.Size < 0 || saved.Size > maxUnpacked {
 			return nil, fmt.Errorf("invalid receipt entry")
 		}
-		f, err := base.Open(saved.Name)
+		f, err := openCacheFile(base, saved.Name)
 		if err != nil {
 			return nil, err
 		}

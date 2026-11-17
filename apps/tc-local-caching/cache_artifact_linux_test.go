@@ -7,12 +7,14 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"golang.org/x/sys/unix"
 	"io"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 )
 
 type objectMap struct {
@@ -253,5 +255,42 @@ func TestCorruptManifestRecoversWithoutChangingVersion(t *testing.T) {
 	a.close()
 	if source.calls[req.ManifestKey] != 2 {
 		t.Fatal("manifest was not recovered")
+	}
+}
+
+func TestAcquireRejectsReplacedNonRegularCacheFile(t *testing.T) {
+	objects, req, err := makeArtifacts("nonregular", map[string][]byte{"1.in": []byte("x"), "1.out": []byte("y")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	c, _ := artifactCache(t, objects, t.TempDir())
+	a, err := c.acquire(t.Context(), req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	a.close()
+	var path string
+	c.mu.Lock()
+	for k, e := range c.entries {
+		if strings.HasPrefix(k, "b:") {
+			path = filepath.Join(e.path, "1.in")
+		}
+	}
+	c.mu.Unlock()
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	if err := unix.Mkfifo(path, 0600); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() { a, err := c.acquire(t.Context(), req); a.close(); done <- err }()
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("accepted FIFO testcase")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("blocked opening non-regular cache file")
 	}
 }

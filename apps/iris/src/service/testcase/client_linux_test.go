@@ -122,7 +122,7 @@ func TestFDClientRejectsBadResponsesWithoutLeaks(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			defer file.Close()
+			t.Cleanup(func() { file.Close() })
 			socket := stubManager(t, func(c *net.UnixConn, _ request) {
 				res := reply{TestcaseSetID: "v", Cases: []caseMetadata{{ID: 1}}}
 				switch mode {
@@ -307,7 +307,7 @@ func TestReceiverFDLimit(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer f.Close()
+	t.Cleanup(func() { f.Close() })
 	socket := stubManager(t, func(c *net.UnixConn, _ request) {
 		cases := make([]caseMetadata, 40)
 		for i := range cases {

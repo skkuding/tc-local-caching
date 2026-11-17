@@ -8,7 +8,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"os"
 	"path/filepath"
 )
@@ -54,12 +53,7 @@ func (c *cache) manifest(ctx context.Context, req request) (*Manifest, error) {
 			continue
 		}
 		entry := entries[key]
-		f, err := os.Open(entry.path)
-		var data []byte
-		if err == nil {
-			data, err = io.ReadAll(io.LimitReader(f, maxManifest+1))
-			err = errors.Join(err, f.Close())
-		}
+		data, err := readCachedManifest(entry.path)
 		unlock()
 		var m *Manifest
 		if err == nil {

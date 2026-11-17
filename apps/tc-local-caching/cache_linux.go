@@ -120,7 +120,7 @@ func newCache(ctx context.Context, root string, source BundleSource, high, low i
 		if d.IsDir() {
 			continue
 		}
-		data, err := os.ReadFile(path)
+		data, err := readCachedManifest(path)
 		_, parseErr := ParseManifest(data)
 		if err != nil || parseErr != nil || len(data) > maxManifest || len(d.Name()) != 69 {
 			if err := os.Remove(path); err != nil {
@@ -264,7 +264,7 @@ func (c *cache) acquire(ctx context.Context, req request) (acquired, error) {
 			return acquired{}, err
 		}
 		for _, name := range []string{tc.Input, tc.Output} {
-			f, err := root.Open(name)
+			f, err := openCacheFile(root, name)
 			if err == nil {
 				info, e := f.Stat()
 				if e != nil || !info.Mode().IsRegular() {
