@@ -113,8 +113,8 @@ func main() {
 		logProvider.Log(logger.ERROR, fmt.Sprintf("Failed to create Postgres data source: %v", err))
 		return
 	}
-	cacheRoot := utils.Getenv("TESTCASE_CACHE_PATH", "/cache/testcases")
-	testcaseManager := testcase.NewTestcaseManager(s3reader, database, logProvider, cacheRoot)
+	managerSocket := utils.Getenv("TC_MANAGER_SOCKET", "/run/tc-cache/manager.sock")
+	testcaseManager := testcase.NewTestcaseManager(s3reader, database, logProvider, managerSocket)
 
 	fileManager := file.NewFileManager(constants.RESULT_PATH)
 

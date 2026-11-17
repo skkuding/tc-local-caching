@@ -30,32 +30,31 @@ type testcaseDatabase interface {
 
 type testcaseObjectReader interface {
 	Get(string) ([]loader.ElementOut, error)
-	loader.BundleSource
 }
 
 type testcaseManager struct {
-	database  testcaseDatabase
-	s3reader  testcaseObjectReader
-	logger    logger.Logger
-	cacheRoot string
+	database      testcaseDatabase
+	s3reader      testcaseObjectReader
+	logger        logger.Logger
+	managerSocket string
 }
 
 func NewTestcaseManager(
 	s3reader *loader.S3reader,
 	database *loader.Postgres,
 	logProvider logger.Logger,
-	cacheRoot string,
+	managerSocket string,
 ) TestcaseManager {
 	return &testcaseManager{
-		s3reader:  s3reader,
-		database:  database,
-		logger:    logProvider,
-		cacheRoot: cacheRoot,
+		s3reader:      s3reader,
+		database:      database,
+		logger:        logProvider,
+		managerSocket: managerSocket,
 	}
 }
 
 func (t *testcaseManager) GetVersionedTestcase(ctx context.Context, testcaseSetID, manifestKey string, filter TestcaseFilterCode) (Testcase, error) {
-	return GetVersionedTestcase(ctx, t.cacheRoot, t.s3reader, testcaseSetID, manifestKey, filter)
+	return GetVersionedTestcase(ctx, t.managerSocket, testcaseSetID, manifestKey, filter)
 }
 
 // SaveTestcase takes ownership of data and overwrites each element's ProblemId and Hidden fields.
