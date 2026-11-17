@@ -156,3 +156,6 @@ coverage
 .claude/settings.local.json
 **/CLAUDE**
 CLAUDE.*
+
+# Local testcase integration binaries and kind kubeconfig
+.tc-integration-bin/

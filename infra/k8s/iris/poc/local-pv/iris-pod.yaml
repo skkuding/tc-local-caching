@@ -18,8 +18,8 @@ metadata:
   namespace: iris
 data:
   APP_ENV: 'stage'
-  DISABLE_INSTRUMENTATION: 'true'
-  TESTCASE_CACHE_PATH: '/cache/testcases'
+  OTEL_SDK_DISABLED: 'true'
+  TC_MANAGER_SOCKET: '/run/tc-cache/manager.sock'
   TESTCASE_BUCKET_NAME: 'codedang-testcase'
   MINIO_ENDPOINT_URL: 'http://host.docker.internal:9000'
   AWS_ACCESS_KEY_ID: 'skku'
@@ -48,6 +48,8 @@ metadata:
     app: iris-local-pv-poc
 spec:
   restartPolicy: Never
+  nodeSelector:
+    kubernetes.io/hostname: iris-pv-poc-control-plane
   containers:
     - name: iris
       image: codedang-iris:tas3060-poc
@@ -77,14 +79,16 @@ spec:
       securityContext:
         privileged: true
       volumeMounts:
-        - name: testcase-cache
-          mountPath: /cache/testcases
+        - name: socket
+          mountPath: /run/tc-cache
+          readOnly: true
         - name: cgroup
           mountPath: /sys/fs/cgroup
   volumes:
-    - name: testcase-cache
-      persistentVolumeClaim:
-        claimName: iris-tc-local-poc
+    - name: socket
+      hostPath:
+        path: /var/run/tc-cache-poc
+        type: DirectoryOrCreate
     - name: cgroup
       hostPath:
         path: /sys/fs/cgroup

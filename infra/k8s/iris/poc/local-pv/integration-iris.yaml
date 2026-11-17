@@ -1,0 +1,33 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: iris
+  namespace: tc-cache-integration
+spec:
+  restartPolicy: Never
+  nodeSelector:
+    kubernetes.io/hostname: tc-cache-integration-control-plane
+  containers:
+    - name: iris
+      image: tc-local-caching:integration
+      imagePullPolicy: Never
+      command: [bash, '-ec']
+      args:
+        - |
+          export CONTAINER_ID="tc-kind-${BASHPID}"
+          cg="/sys/fs/cgroup/sandbox-$CONTAINER_ID"
+          mkdir -p "$cg"
+          echo +memory > "$cg/cgroup.subtree_control"
+          trap 'rmdir "$cg" 2>/dev/null || true' EXIT
+          iris-handler.test -test.run '^TestManagerWithRealJudgeAndRun$' -test.v -test.timeout=2m
+      env:
+        - {name: TC_MANAGER_SOCKET, value: /run/tc-cache/manager.sock}
+      securityContext: {privileged: true}
+      volumeMounts:
+        - {name: socket, mountPath: /run/tc-cache, readOnly: true}
+        - {name: cgroup, mountPath: /sys/fs/cgroup}
+  volumes:
+    - name: socket
+      hostPath: {path: /var/run/tc-cache-integration, type: DirectoryOrCreate}
+    - name: cgroup
+      hostPath: {path: /sys/fs/cgroup, type: Directory}

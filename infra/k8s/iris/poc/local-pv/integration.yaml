@@ -1,0 +1,102 @@
+# Self-contained test deployment for the tc-cache-integration kind cluster.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: tc-cache-integration
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: default
+  namespace: tc-cache-integration
+automountServiceAccountToken: false
+---
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: tc-cache-integration
+provisioner: kubernetes.io/no-provisioner
+volumeBindingMode: WaitForFirstConsumer
+---
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: tc-cache-integration
+spec:
+  capacity: {storage: 128Mi}
+  accessModes: [ReadWriteOnce]
+  storageClassName: tc-cache-integration
+  persistentVolumeReclaimPolicy: Retain
+  local: {path: /var/lib/tc-cache-integration/cache}
+  nodeAffinity:
+    required:
+      nodeSelectorTerms:
+        - matchExpressions:
+            - key: kubernetes.io/hostname
+              operator: In
+              values: [tc-cache-integration-control-plane]
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: cache
+  namespace: tc-cache-integration
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: tc-cache-integration
+  volumeName: tc-cache-integration
+  resources:
+    requests: {storage: 128Mi}
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: seed
+  namespace: tc-cache-integration
+spec:
+  template:
+    spec:
+      restartPolicy: Never
+      nodeSelector:
+        kubernetes.io/hostname: tc-cache-integration-control-plane
+      containers:
+        - name: seed
+          image: tc-local-caching:dev
+          imagePullPolicy: Never
+          args: [seed-local, '-root', /objects]
+          volumeMounts:
+            - {name: objects, mountPath: /objects}
+      volumes:
+        - name: objects
+          hostPath: {path: /var/lib/tc-cache-integration/objects, type: DirectoryOrCreate}
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: manager
+  namespace: tc-cache-integration
+spec:
+  restartPolicy: Always
+  nodeSelector:
+    kubernetes.io/hostname: tc-cache-integration-control-plane
+  containers:
+    - name: manager
+      image: tc-local-caching:dev
+      imagePullPolicy: Never
+      args: [serve, '-high', '33554432', '-low', '16777216']
+      env:
+        - {name: TC_OBJECT_ROOT, value: /objects}
+      readinessProbe:
+        exec: {command: [/tc-cache, stats]}
+        periodSeconds: 1
+      volumeMounts:
+        - {name: cache, mountPath: /cache}
+        - {name: socket, mountPath: /run/tc-cache}
+        - {name: objects, mountPath: /objects, readOnly: true}
+  volumes:
+    - name: cache
+      persistentVolumeClaim: {claimName: cache}
+    - name: socket
+      hostPath: {path: /var/run/tc-cache-integration, type: DirectoryOrCreate}
+    - name: objects
+      hostPath: {path: /var/lib/tc-cache-integration/objects, type: DirectoryOrCreate}

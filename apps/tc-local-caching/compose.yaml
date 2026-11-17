@@ -35,7 +35,7 @@ services:
     command: ['hold']
     network_mode: none
     volumes:
-      - cache-data:/cache
+      - cache-v2-data:/cache
 
   manager:
     image: tc-local-caching:dev
@@ -55,42 +55,35 @@ services:
       timeout: 1s
       retries: 15
     volumes:
-      - cache-data:/cache
+      - cache-v2-data:/cache
       - socket:/run/tc-cache
     tmpfs:
       - /tmp:size=72m
 
-  client:
-    <<: *tc-runtime
+  verify:
+    image: tc-local-caching:integration
+    build:
+      context: ../..
+      dockerfile: apps/tc-local-caching/integration.Dockerfile
     profiles: ['tools']
-    command: ['read']
-    network_mode: none
     depends_on:
       manager:
         condition: service_healthy
+    environment:
+      TC_MANAGER_SOCKET: /run/tc-cache/manager.sock
     volumes:
       - socket:/run/tc-cache:ro
-      - pins:/pins:ro
-
-  verify:
-    image: tc-local-caching:verify
-    build:
-      context: .
-      target: verify
-    profiles: ['tools']
-    environment: *silo-env
-    depends_on:
-      seed:
-        condition: service_completed_successfully
+    privileged: true
+    cgroup: private
     tmpfs:
-      - /tmp:size=72m
       - /test-cache:size=16m
+
 
 volumes:
   silo-data:
   pins:
   socket:
-  cache-data:
+  cache-v2-data:
     driver: local
     driver_opts:
       type: tmpfs
