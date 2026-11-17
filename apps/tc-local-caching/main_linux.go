@@ -3,20 +3,16 @@
 package main
 
 import (
-	"bufio"
 	"context"
 	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
-	"io"
 	"log"
 	"net"
 	"os"
 	"os/signal"
 	"path/filepath"
-	"strconv"
-	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -27,7 +23,7 @@ import (
 const (
 	defaultSocket  = "/run/tc-cache/manager.sock"
 	defaultPins    = "/pins/pins.json"
-	defaultCache   = "/cache"
+	defaultCache   = "/cache/v2"
 	maxConnections = 8
 )
 
@@ -41,10 +37,17 @@ func main() {
 
 func run(ctx context.Context, args []string) error {
 	if len(args) == 0 {
-		return errors.New("expected serve, seed, read, stats, or hold")
+		return errors.New("expected serve, seed, stats, or hold")
 	}
 	flags := flag.NewFlagSet(args[0], flag.ContinueOnError)
 	switch args[0] {
+	case "seed-local":
+		root := flags.String("root", "/objects", "output object root")
+		if err := flags.Parse(args[1:]); err != nil {
+			return err
+		}
+		return seedLocal(*root)
+
 	case "serve":
 		socket := flags.String("socket", defaultSocket, "Unix socket path")
 		root := flags.String("cache", defaultCache, "cache filesystem root")
@@ -53,7 +56,7 @@ func run(ctx context.Context, args []string) error {
 		if err := flags.Parse(args[1:]); err != nil {
 			return err
 		}
-		source, err := newObjectSource()
+		source, err := configuredSource()
 		if err != nil {
 			return err
 		}
@@ -70,8 +73,6 @@ func run(ctx context.Context, args []string) error {
 		ctx, cancel := context.WithTimeout(ctx, 60*time.Second)
 		defer cancel()
 		return source.seed(ctx, *pinsPath)
-	case "read":
-		return readCommand(ctx, flags, args[1:])
 	case "stats":
 		socket := flags.String("socket", defaultSocket, "Unix socket path")
 		if err := flags.Parse(args[1:]); err != nil {
@@ -90,8 +91,14 @@ func run(ctx context.Context, args []string) error {
 	}
 }
 
-func serve(ctx context.Context, socket, root string, source bundleSource, high, low int64) error {
-	// open flock to maintain manager only one
+func serve(ctx context.Context, socket, root string, source BundleSource, high, low int64) error {
+	if err := os.MkdirAll(root, 0700); err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(socket), 0750); err != nil {
+		return err
+	}
+	// A single process owns this cache namespace.
 	lock, err := os.OpenFile(filepath.Join(root, ".owner.lock"), os.O_CREATE|os.O_RDWR, 0o600)
 	if err != nil {
 		return err
@@ -165,17 +172,16 @@ func serve(ctx context.Context, socket, root string, source bundleSource, high, 
 			return err
 		}
 
-
 		select {
 		case slots <- struct{}{}:
 			requests.Add(1)
 			go func() {
 				defer requests.Done()
-				
+
 				// set context cancellation function
 				stop := context.AfterFunc(ctx, func() { conn.Close() })
 				defer stop()
-				
+
 				// return conn
 				defer func() { <-slots }()
 				defer conn.Close()
@@ -189,59 +195,4 @@ func serve(ctx context.Context, socket, root string, source bundleSource, high, 
 			conn.Close()
 		}
 	}
-}
-
-func readCommand(ctx context.Context, flags *flag.FlagSet, args []string) error {
-	socket := flags.String("socket", defaultSocket, "Unix socket path")
-	pinsPath := flags.String("pins", defaultPins, "file containing fixture pins")
-	version := flags.String("version", "sum-v1", "requested version")
-	digest := flags.String("sha256", "", "expected SHA-256, defaults to the fixture pin")
-	cases := flags.String("cases", "", "comma-separated testcase IDs, default all")
-	wait := flags.Bool("wait", false, "hold the files until stdin receives a newline")
-	if err := flags.Parse(args); err != nil {
-		return err
-	}
-	p := pin{*version, *digest}
-	if *digest == "" {
-		data, err := os.ReadFile(*pinsPath)
-		if err != nil {
-			return err
-		}
-		var pins map[string]pin
-		if err := json.Unmarshal(data, &pins); err != nil {
-			return err
-		}
-		var ok bool
-		p, ok = pins[*version]
-		if !ok {
-			return fmt.Errorf("missing pin for version %s", *version)
-		}
-	}
-	var ids []string
-	if *cases != "" {
-		ids = strings.Split(*cases, ",")
-	}
-	result, err := acquireFiles(ctx, *socket, p, ids)
-	if err != nil {
-		return err
-	}
-	defer result.close()
-	if *wait {
-		fmt.Fprintln(os.Stderr, "acquired")
-		if _, err := bufio.NewReader(os.Stdin).ReadString('\n'); err != nil {
-			return err
-		}
-	}
-	for i, id := range result.ids {
-		for j, suffix := range []string{".in", ".out"} {
-			file := result.files[2*i+j]
-			data, err := io.ReadAll(file)
-			file.Close()
-			if err != nil {
-				return err
-			}
-			fmt.Printf("%s%s %s\n", id, suffix, strconv.Quote(string(data)))
-		}
-	}
-	return nil
 }

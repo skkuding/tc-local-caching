@@ -4,8 +4,6 @@ package main
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -20,299 +18,274 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-var (
-	errInvalid  = errors.New("invalid request")
-	errCapacity = errors.New("cache or FD capacity exhausted")
-)
+const maxCases = 512
+const maxManifest = 256 << 10
 
-type bundleSource interface {
-	open(context.Context, pin) (io.ReadCloser, error)
-}
+var errInvalid = errors.New("invalid request")
+var errCapacity = errors.New("cache or FD capacity exhausted")
 
 type cacheEntry struct {
-	pin      pin
-	manifest manifest
+	// Never wait for filesMu while holding cache.mu. When both are needed,
+	// acquire filesMu first. Published paths remain immutable.
+	filesMu  sync.RWMutex
+	path     string
 	lastUsed time.Time
-	loading  chan struct{}
-	err      error
 }
-
+type loadResult struct {
+	done chan struct{}
+	err  error
+}
 type cache struct {
-	root      string
-	source    bundleSource
-	high, low int64
-	loadSlot  chan struct{}
-	ctx       context.Context
-	mu        sync.Mutex
-	loads     sync.WaitGroup
-	entries   map[string]*cacheEntry
-	downloads map[string]int
-	pending   int
+	root          string
+	source        BundleSource
+	high, low     int64
+	ctx           context.Context
+	mu            sync.Mutex // entries, refs, loading, downloads and lastUsed
+	entries       map[string]*cacheEntry
+	refs          map[string]int
+	loading       map[string]*loadResult
+	downloads     map[string]int
+	slot          chan struct{}
+	loads         sync.WaitGroup
+	removeEvicted func(string) error // defaults to os.RemoveAll; allows removal fault injection
 }
-
-func newCache(ctx context.Context, root string, source bundleSource, high, low int64) (*cache, error) {
-	if low <= 0 || high <= low {
-		return nil, errors.New("watermarks must satisfy 0 < low < high")
-	}
-	c := &cache{
-		root: root, source: source, high: high, low: low, ctx: ctx,
-		loadSlot: make(chan struct{}, 1), entries: make(map[string]*cacheEntry),
-		downloads: make(map[string]int),
-	}
-	dirs, err := os.ReadDir(root)
-	if err != nil {
-		return nil, err
-	}
-	for _, dir := range dirs {
-		path := filepath.Join(root, dir.Name())
-		if strings.HasPrefix(dir.Name(), ".stage-") || strings.HasPrefix(dir.Name(), ".evict-") {
-			if err := os.RemoveAll(path); err != nil {
-				return nil, err
-			}
-			continue
-		}
-		if !dir.IsDir() || !identifier.MatchString(dir.Name()) {
-			continue
-		}
-		entry, err := readEntry(path, dir.Name())
-		if err != nil {
-			log.Printf("discarding cache entry %s: %v", dir.Name(), err)
-			if err := os.RemoveAll(path); err != nil {
-				return nil, err
-			}
-			continue
-		}
-		c.entries[dir.Name()] = entry
-	}
-	return c, nil
-}
-
-func readEntry(path, version string) (*cacheEntry, error) {
-	raw, err := os.Open(filepath.Join(path, "receipt.json"))
-	if err != nil {
-		return nil, err
-	}
-	data, readErr := io.ReadAll(io.LimitReader(raw, maxManifest+1))
-	if err := errors.Join(readErr, raw.Close()); err != nil {
-		return nil, err
-	}
-	var saved receipt
-	if len(data) > maxManifest || json.Unmarshal(data, &saved) != nil || !saved.Pin.valid() || saved.Pin.Version != version {
-		return nil, errors.New("invalid receipt")
-	}
-	if err := saved.Manifest.validate(version); err != nil {
-		return nil, err
-	}
-	for _, expected := range saved.Manifest.files() {
-		file, err := openReadonly(filepath.Join(path, expected.name))
-		if err != nil {
-			return nil, err
-		}
-		if err := errors.Join(verifyFile(file, expected.blob), file.Close()); err != nil {
-			return nil, err
-		}
-	}
-	info, err := os.Stat(path)
-	if err != nil {
-		return nil, err
-	}
-	return &cacheEntry{pin: saved.Pin, manifest: saved.Manifest, lastUsed: info.ModTime()}, nil
-}
-
-func openReadonly(path string) (*os.File, error) {
-	fd, err := unix.Open(path, unix.O_RDONLY|unix.O_CLOEXEC|unix.O_NOFOLLOW|unix.O_NONBLOCK, 0)
-	if err != nil {
-		return nil, err
-	}
-	file := os.NewFile(uintptr(fd), path)
-	info, err := file.Stat()
-	if err != nil || !info.Mode().IsRegular() {
-		file.Close()
-		return nil, errors.Join(err, errors.New("cache path is not a regular file"))
-	}
-	return file, nil
-}
-
 type acquired struct {
-	ids   []string
+	cases []caseMetadata
 	files []*os.File
 }
 
 func (a acquired) close() {
-	for _, file := range a.files {
-		file.Close()
+	for _, f := range a.files {
+		_ = f.Close()
 	}
 }
 
-func (c *cache) acquire(ctx context.Context, p pin, ids []string) (acquired, error) {
-	if !p.valid() || len(ids) > maxCases {
-		return acquired{}, fmt.Errorf("%w: invalid version, SHA-256, or testcase count", errInvalid)
+func newCache(ctx context.Context, root string, source BundleSource, high, low int64) (*cache, error) {
+	if low <= 0 || high <= low {
+		return nil, errors.New("watermarks must satisfy 0 < low < high")
 	}
-	seen := make(map[string]bool, len(ids))
-	for _, id := range ids {
-		if !identifier.MatchString(id) || seen[id] {
-			return acquired{}, fmt.Errorf("%w: invalid or duplicate testcase ID %q", errInvalid, id)
+	c := &cache{root: root, source: source, high: high, low: low, ctx: ctx, entries: map[string]*cacheEntry{}, refs: map[string]int{}, loading: map[string]*loadResult{}, downloads: map[string]int{}, slot: make(chan struct{}, 1), removeEvicted: os.RemoveAll}
+	for _, d := range []string{"manifests", "sha256", "tmp"} {
+		if err := os.MkdirAll(filepath.Join(root, d), 0700); err != nil {
+			return nil, err
 		}
-		seen[id] = true
 	}
-	for {
-		if err := ctx.Err(); err != nil {
+	// Only this owner may touch the namespace. No old gzip cache is inventoried.
+	if err := os.RemoveAll(filepath.Join(root, "tmp")); err != nil {
+		return nil, err
+	}
+	if err := os.MkdirAll(filepath.Join(root, "tmp"), 0700); err != nil {
+		return nil, err
+	}
+	err := filepath.WalkDir(filepath.Join(root, "sha256"), func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if !d.IsDir() {
+			return nil
+		}
+		if strings.HasPrefix(d.Name(), ".install-") {
+			if err := os.RemoveAll(path); err != nil {
+				return err
+			}
+			return filepath.SkipDir
+		}
+		if len(d.Name()) != 64 {
+			return nil
+		}
+		receipt, err := readReceipt(path)
+		if err != nil {
+			if err := os.RemoveAll(path); err != nil {
+				return err
+			}
+			return filepath.SkipDir
+		}
+		_ = receipt
+		info, err := d.Info()
+		if err != nil {
+			return err
+		}
+		c.entries["b:"+d.Name()] = &cacheEntry{path: path, lastUsed: info.ModTime()}
+		return filepath.SkipDir
+	})
+	if err != nil {
+		return nil, err
+	}
+	dirs, err := os.ReadDir(filepath.Join(root, "manifests"))
+	if err != nil {
+		return nil, err
+	}
+	for _, d := range dirs {
+		path := filepath.Join(root, "manifests", d.Name())
+		if d.IsDir() {
+			continue
+		}
+		data, err := os.ReadFile(path)
+		_, parseErr := ParseManifest(data)
+		if err != nil || parseErr != nil || len(data) > maxManifest || len(d.Name()) != 69 {
+			if err := os.Remove(path); err != nil {
+				return nil, err
+			}
+			continue
+		}
+		info, err := d.Info()
+		if err != nil {
+			return nil, err
+		}
+		c.entries["m:"+strings.TrimSuffix(d.Name(), ".json")] = &cacheEntry{path: path, lastUsed: info.ModTime()}
+	}
+	return c, nil
+}
+func (c *cache) protect(keys []string) func() {
+	c.mu.Lock()
+	for _, k := range keys {
+		c.refs[k]++
+	}
+	c.mu.Unlock()
+	return func() {
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		for _, k := range keys {
+			c.refs[k]--
+			if c.refs[k] == 0 {
+				delete(c.refs, k)
+			}
+		}
+	}
+}
+
+// A waiter cancelling never cancels a load needed by other callers.
+func (c *cache) ensure(ctx context.Context, key string, install func(context.Context) (string, error)) error {
+	c.mu.Lock()
+	if e := c.entries[key]; e != nil {
+		e.lastUsed = time.Now()
+		c.mu.Unlock()
+		return nil
+	}
+	load := c.loading[key]
+	if load == nil {
+		if len(c.loading) >= maxConnections*2 {
+			c.mu.Unlock()
+			return errCapacity
+		}
+		load = &loadResult{done: make(chan struct{})}
+		c.loading[key] = load
+		c.loads.Add(1)
+		go func() {
+			defer c.loads.Done()
+			loadCtx, cancel := context.WithTimeout(c.ctx, 30*time.Second)
+			defer cancel()
+			var path string
+			var err error
+			select {
+			case c.slot <- struct{}{}:
+				path, err = install(loadCtx)
+				<-c.slot
+			case <-loadCtx.Done():
+				err = loadCtx.Err()
+			}
+			c.mu.Lock()
+			defer c.mu.Unlock()
+			load.err = err
+			if err == nil {
+				c.entries[key] = &cacheEntry{path: path, lastUsed: time.Now()}
+			}
+			delete(c.loading, key)
+			close(load.done)
+		}()
+	}
+	c.mu.Unlock()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-load.done:
+		return load.err
+	}
+}
+func (c *cache) acquire(ctx context.Context, req request) (acquired, error) {
+	if strings.TrimSpace(req.TestcaseSetID) == "" || strings.TrimSpace(req.ManifestKey) == "" || len(req.ManifestKey) > 4096 || len(req.TestcaseSetID) > 512 || (req.Filter != "all" && req.Filter != "public" && req.Filter != "hidden") {
+		return acquired{}, errInvalid
+	}
+	m, err := c.manifest(ctx, req)
+	if err != nil {
+		return acquired{}, err
+	}
+	var selected []ManifestTestcase
+	needed := map[string]bool{}
+	for _, tc := range m.Testcases {
+		if (req.Filter == "public" && tc.Hidden) || (req.Filter == "hidden" && !tc.Hidden) {
+			continue
+		}
+		selected = append(selected, tc)
+		needed[tc.BundleID] = true
+	}
+	var bundles []ManifestBundle
+	var keys []string
+	for _, b := range m.Bundles {
+		if needed[b.ID] {
+			bundles = append(bundles, b)
+			keys = append(keys, "b:"+strings.TrimPrefix(b.Checksum, "sha256:"))
+		}
+	}
+	release := c.protect(keys)
+	defer release()
+	for _, b := range bundles {
+		key := "b:" + strings.TrimPrefix(b.Checksum, "sha256:")
+		err := c.ensure(ctx, key, func(ctx context.Context) (string, error) {
+			c.mu.Lock()
+			c.downloads[b.Checksum]++
+			c.mu.Unlock()
+			return installBundle(ctx, c.root, c.source, *m, b.ID, c.reserve)
+		})
+		if err != nil {
 			return acquired{}, err
 		}
-		c.mu.Lock()
-		entry := c.entries[p.Version]
-		if entry == nil {
-			if c.pending >= maxConnections {
-				c.mu.Unlock()
-				return acquired{}, fmt.Errorf("%w: too many pending version loads", errCapacity)
-			}
-			c.pending++
-			entry = &cacheEntry{pin: p, loading: make(chan struct{})}
-			c.entries[p.Version] = entry
-			c.loads.Add(1)
-			go c.load(entry)
+	}
+	result := acquired{cases: make([]caseMetadata, 0, len(selected))}
+	// Hold all selected bundle read locks until the complete file set is open.
+	// Preparation refs also protect bundles while other bundles are still loading.
+	entries, unlockFiles, err := c.lockFiles(keys)
+	if err != nil {
+		return acquired{}, err
+	}
+	defer unlockFiles()
+	paths := map[string]string{}
+	for _, b := range bundles {
+		paths[b.ID] = entries["b:"+strings.TrimPrefix(b.Checksum, "sha256:")].path
+	}
+	for _, tc := range selected {
+		if err := ctx.Err(); err != nil {
+			result.close()
+			return acquired{}, err
 		}
-		if entry.loading != nil {
-			// Concurrent requests for the version share the outcome of this load.
-			done := entry.loading
-			c.mu.Unlock()
-			select {
-			case <-ctx.Done():
-				return acquired{}, ctx.Err()
-			case <-done:
-				if entry.err != nil {
-					return acquired{}, entry.err
+		root, err := os.OpenRoot(paths[tc.BundleID])
+		if err != nil {
+			result.close()
+			return acquired{}, err
+		}
+		for _, name := range []string{tc.Input, tc.Output} {
+			f, err := root.Open(name)
+			if err == nil {
+				info, e := f.Stat()
+				if e != nil || !info.Mode().IsRegular() {
+					f.Close()
+					err = errors.Join(e, errors.New("not a regular testcase file"))
 				}
 			}
-			continue
-		}
-		if entry.pin != p {
-			c.mu.Unlock()
-			return acquired{}, fmt.Errorf("%w: checksum conflicts with cached version %s", errInvalid, p.Version)
-		}
-		result, err := c.openSet(entry, ids)
-		if err == nil {
-			entry.lastUsed = time.Now()
-		}
-		if errors.Is(err, os.ErrNotExist) {
-			evictErr := c.evictLocked(entry)
-			c.mu.Unlock()
-			if evictErr != nil {
-				return acquired{}, evictErr
-			}
-			continue
-		}
-		c.mu.Unlock()
-		return result, err
-	}
-}
-
-// The caller holds c.mu from the first open until the complete set is pinned.
-func (c *cache) openSet(entry *cacheEntry, ids []string) (acquired, error) {
-	known := make(map[string]bool, len(entry.manifest.Cases))
-	for _, tc := range entry.manifest.Cases {
-		known[tc.ID] = true
-	}
-	if len(ids) == 0 {
-		for _, tc := range entry.manifest.Cases {
-			ids = append(ids, tc.ID)
-		}
-	}
-	for _, id := range ids {
-		if !known[id] {
-			return acquired{}, fmt.Errorf("%w: unknown testcase ID %q", errInvalid, id)
-		}
-	}
-	result := acquired{ids: ids, files: make([]*os.File, 0, 2*len(ids))}
-	for _, id := range ids {
-		for _, suffix := range []string{".in", ".out"} {
-			file, err := openReadonly(filepath.Join(c.root, entry.pin.Version, id+suffix))
 			if err != nil {
+				root.Close()
 				result.close()
 				if errors.Is(err, unix.EMFILE) || errors.Is(err, unix.ENFILE) {
-					return acquired{}, errors.Join(errCapacity, err)
+					err = errors.Join(errCapacity, err)
 				}
 				return acquired{}, err
 			}
-			result.files = append(result.files, file)
+			result.files = append(result.files, f)
 		}
+		root.Close()
+		result.cases = append(result.cases, caseMetadata{tc.ID, tc.Hidden, tc.ScoreWeight})
 	}
 	return result, nil
-}
-
-func (c *cache) load(entry *cacheEntry) {
-	defer c.loads.Done()
-	ctx, cancel := context.WithTimeout(c.ctx, 30*time.Second)
-	defer cancel()
-	var m manifest
-	var err error
-	select {
-	case c.loadSlot <- struct{}{}:
-		defer func() { <-c.loadSlot }()
-		m, err = c.install(ctx, entry.pin)
-	case <-ctx.Done():
-		err = ctx.Err()
-	}
-
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.pending--
-	entry.err = err
-	if err != nil {
-		delete(c.entries, entry.pin.Version)
-		log.Printf("load %s: %v", entry.pin.Version, err)
-	} else {
-		entry.manifest = m
-		entry.lastUsed = time.Now()
-	}
-	close(entry.loading)
-	entry.loading = nil
-}
-
-func (c *cache) install(ctx context.Context, p pin) (manifest, error) {
-	c.mu.Lock()
-	c.downloads[p.Version]++
-	c.mu.Unlock()
-	log.Printf("download %s", p.objectKey())
-
-	body, err := c.source.open(ctx, p)
-	if err != nil {
-		return manifest{}, fmt.Errorf("fetch exact version %s: %w", p.Version, err)
-	}
-	defer body.Close()
-	archive, err := os.CreateTemp("", "tc-bundle-*")
-	if err != nil {
-		return manifest{}, err
-	}
-	// Unlink the spool immediately. Only this manager's open file can retain it.
-	defer archive.Close()
-	if err := os.Remove(archive.Name()); err != nil {
-		return manifest{}, err
-	}
-	hash := sha256.New()
-	n, err := io.Copy(io.MultiWriter(archive, hash), io.LimitReader(body, maxBundle+1))
-	if err != nil {
-		return manifest{}, err
-	}
-	if n > maxBundle || fmt.Sprintf("%x", hash.Sum(nil)) != p.SHA256 {
-		return manifest{}, fmt.Errorf("bundle size or SHA-256 mismatch for %s", p.Version)
-	}
-	if _, err := archive.Seek(0, io.SeekStart); err != nil {
-		return manifest{}, err
-	}
-	stage, err := os.MkdirTemp(c.root, ".stage-")
-	if err != nil {
-		return manifest{}, err
-	}
-	defer os.RemoveAll(stage)
-	m, err := unpackBundle(archive, p, stage, c.reserve)
-	if err != nil {
-		return manifest{}, err
-	}
-	if err := writeJSON(filepath.Join(stage, "receipt.json"), receipt{p, m}); err != nil {
-		return manifest{}, err
-	}
-	return m, os.Rename(stage, filepath.Join(c.root, p.Version))
 }
 
 type fsUsage struct {
@@ -333,67 +306,134 @@ func usage(path string) (fsUsage, error) {
 	return fsUsage{int64(s.Blocks-s.Bfree) * block, int64(s.Bavail) * block, block}, nil
 }
 
-func (c *cache) reserve(m manifest) error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	current, err := usage(c.root)
+// lockFiles pins ready entries with read locks. Sort and deduplicate keys so
+// overlapping requests use one order and never recursively RLock an entry while
+// a writer is pending. Callers protect keys during preparation with refs.
+func (c *cache) lockFiles(keys []string) (map[string]*cacheEntry, func(), error) {
+	ordered := append([]string(nil), keys...)
+	sort.Strings(ordered)
+	unique := ordered[:0]
+	for _, key := range ordered {
+		if len(unique) == 0 || key != unique[len(unique)-1] {
+			unique = append(unique, key)
+		}
+	}
+	for {
+		c.mu.Lock()
+		entries := make(map[string]*cacheEntry, len(unique))
+		for _, key := range unique {
+			entry := c.entries[key]
+			if entry == nil {
+				c.mu.Unlock()
+				return nil, nil, errors.New("cache entry disappeared before file acquisition")
+			}
+			entries[key] = entry
+		}
+		c.mu.Unlock()
+		for _, key := range unique {
+			entries[key].filesMu.RLock()
+		}
+		unlock := func() {
+			for i := len(unique) - 1; i >= 0; i-- {
+				entries[unique[i]].filesMu.RUnlock()
+			}
+		}
+		c.mu.Lock()
+		valid := true
+		for _, key := range unique {
+			if c.entries[key] != entries[key] {
+				valid = false
+				break
+			}
+		}
+		c.mu.Unlock()
+		if valid {
+			return entries, unlock, nil
+		}
+		unlock()
+	}
+}
+
+// The cold-install slot serializes reservations and writes. Keep filesystem I/O
+// and entry-lock waits outside c.mu so unrelated warm requests can progress.
+func (c *cache) reserve(needed int64) error {
+	u, err := usage(c.root)
 	if err != nil {
 		return err
 	}
-	round := func(size int64) int64 { return ((size + current.block - 1) / current.block) * current.block }
-	metadata, err := json.Marshal(receipt{pin{m.Version, strings.Repeat("0", 64)}, m})
-	if err != nil {
-		return err
-	}
-	needed := round(int64(len(metadata))+1) + 4*current.block
-	for _, file := range m.files() {
-		needed += round(file.Size)
-	}
+	needed = ((needed + u.block - 1) / u.block) * u.block
 	if needed > c.high {
-		return fmt.Errorf("%w: artifact needs %d bytes above the %d-byte high watermark", errCapacity, needed, c.high)
+		return errCapacity
 	}
-	if current.UsedBytes+needed <= c.high && needed <= current.AvailableBytes {
+	if u.UsedBytes+needed <= c.high && u.AvailableBytes >= needed {
 		return nil
 	}
-	candidates := make([]*cacheEntry, 0, len(c.entries))
-	for _, entry := range c.entries {
-		if entry.loading == nil {
-			candidates = append(candidates, entry)
+	type candidate struct {
+		key      string
+		entry    *cacheEntry
+		lastUsed time.Time
+	}
+	c.mu.Lock()
+	var candidates []candidate
+	for key, entry := range c.entries {
+		if c.refs[key] == 0 && c.loading[key] == nil {
+			candidates = append(candidates, candidate{key, entry, entry.lastUsed})
 		}
 	}
+	c.mu.Unlock()
 	sort.Slice(candidates, func(i, j int) bool { return candidates[i].lastUsed.Before(candidates[j].lastUsed) })
-	for _, entry := range candidates {
-		if current.UsedBytes <= c.low && current.UsedBytes+needed <= c.high && current.AvailableBytes >= needed {
+	for _, candidate := range candidates {
+		if u.UsedBytes <= c.low && u.UsedBytes+needed <= c.high && u.AvailableBytes >= needed {
 			break
 		}
-		if err := c.evictLocked(entry); err != nil {
+		if _, err := c.evict(candidate.key, candidate.entry); err != nil {
 			return err
 		}
-		current, err = usage(c.root)
+		u, err = usage(c.root)
 		if err != nil {
 			return err
 		}
 	}
-	if current.UsedBytes+needed > c.high || current.AvailableBytes < needed {
-		return fmt.Errorf("%w: need %d bytes with %d used and %d available", errCapacity, needed, current.UsedBytes, current.AvailableBytes)
+	if u.UsedBytes+needed > c.high || u.AvailableBytes < needed {
+		return fmt.Errorf("%w: need %d with %d used, %d available", errCapacity, needed, u.UsedBytes, u.AvailableBytes)
 	}
 	return nil
 }
 
-// Rename while holding c.mu to exclude opens and leave a recoverable tombstone
-// if removal is interrupted. Existing readers already hold their own FDs.
-func (c *cache) evictLocked(entry *cacheEntry) error {
-	tombstone, err := os.MkdirTemp(c.root, ".evict-")
-	if err != nil {
-		return err
+// Recheck identity and preparation refs after acquiring the entry write lock:
+// LRU candidates may have been protected or replaced since the snapshot.
+func (c *cache) evict(key string, entry *cacheEntry) (bool, error) {
+	entry.filesMu.Lock()
+	c.mu.Lock()
+	if c.entries[key] != entry || c.refs[key] != 0 || c.loading[key] != nil {
+		c.mu.Unlock()
+		entry.filesMu.Unlock()
+		return false, nil
 	}
-	defer os.RemoveAll(tombstone)
-	if err := os.Rename(filepath.Join(c.root, entry.pin.Version), filepath.Join(tombstone, "artifact")); err != nil && !errors.Is(err, os.ErrNotExist) {
-		return err
+	tombstone, err := os.MkdirTemp(filepath.Join(c.root, "tmp"), ".evict-")
+	detached := false
+	if err == nil {
+		err = os.Rename(entry.path, filepath.Join(tombstone, "artifact"))
+		if errors.Is(err, os.ErrNotExist) {
+			err = nil
+		}
+		if err == nil {
+			delete(c.entries, key)
+			detached = true
+		}
 	}
-	delete(c.entries, entry.pin.Version)
-	log.Printf("evict %s", entry.pin.Version)
-	return os.RemoveAll(tombstone)
+	c.mu.Unlock()
+	entry.filesMu.Unlock()
+	if tombstone != "" {
+		// Remove only the private path: a new installation can already occupy the
+		// original path. Existing FDs retain old files; startup cleans any tombstones
+		// left by a failed removal or interrupted process.
+		err = errors.Join(err, c.removeEvicted(tombstone))
+	}
+	if detached {
+		log.Printf("evict %s", key)
+	}
+	return detached, err
 }
 
 type cacheStats struct {
@@ -403,18 +443,19 @@ type cacheStats struct {
 }
 
 func (c *cache) stats() (cacheStats, error) {
+	u, err := usage(c.root)
 	c.mu.Lock()
-	defer c.mu.Unlock()
-	usage, err := usage(c.root)
-	stats := cacheStats{fsUsage: usage, Ready: make([]string, 0), Downloads: make(map[string]int, len(c.downloads))}
-	for version, entry := range c.entries {
-		if entry.loading == nil {
-			stats.Ready = append(stats.Ready, version)
-		}
+	s := cacheStats{fsUsage: u, Ready: []string{}, Downloads: map[string]int{}}
+	for k := range c.entries {
+		s.Ready = append(s.Ready, k)
 	}
-	for version, count := range c.downloads {
-		stats.Downloads[version] = count
+	for k, n := range c.downloads {
+		s.Downloads[k] = n
 	}
-	sort.Strings(stats.Ready)
-	return stats, err
+	c.mu.Unlock()
+	sort.Strings(s.Ready)
+	return s, err
 }
+
+// Keep compile-time assertion next to the manager source contract.
+var _ io.Reader = (*os.File)(nil)

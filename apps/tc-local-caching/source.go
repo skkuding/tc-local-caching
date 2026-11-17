@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -40,9 +41,9 @@ func newObjectSource() (objectSource, error) {
 	return objectSource{client, bucket}, nil
 }
 
-func (s objectSource) open(ctx context.Context, p pin) (io.ReadCloser, error) {
+func (s objectSource) OpenObject(ctx context.Context, key string) (io.ReadCloser, error) {
 	res, err := s.client.GetObject(ctx, &s3.GetObjectInput{
-		Bucket: aws.String(s.bucket), Key: aws.String(p.objectKey()),
+		Bucket: aws.String(s.bucket), Key: aws.String(key),
 	})
 	if err != nil {
 		return nil, err
@@ -63,68 +64,85 @@ func (s objectSource) seed(ctx context.Context, pinsPath string) error {
 		case <-time.After(400 * time.Millisecond):
 		}
 	}
+	refs := map[string]request{}
 	versions, err := fixtures.ReadDir("fixtures")
 	if err != nil {
 		return err
 	}
-	pins := make(map[string]pin)
-	for _, version := range versions {
-		dir := "fixtures/" + version.Name()
-		entries, err := fixtures.ReadDir(dir)
+	for _, v := range versions {
+		objects, req, err := fixtureObjects(v.Name())
 		if err != nil {
 			return err
 		}
-		bodies := make(map[string][]byte, len(entries))
-		for _, entry := range entries {
-			bodies[entry.Name()], err = fixtures.ReadFile(dir + "/" + entry.Name())
-			if err != nil {
+		// Publish the manifest last so it cannot reference missing bundles.
+		for key, data := range objects {
+			if key == req.ManifestKey {
+				continue
+			}
+			if err := s.publish(ctx, key, data); err != nil {
 				return err
 			}
 		}
-		data, p, err := buildBundle(version.Name(), bodies)
-		if err != nil {
+		if err := s.publish(ctx, req.ManifestKey, objects[req.ManifestKey]); err != nil {
 			return err
 		}
-		if err := s.publish(ctx, p, data); err != nil {
-			return err
-		}
-		pins[p.Version] = p
-		fmt.Printf("seeded %s SHA-256 %s\n", p.objectKey(), p.SHA256)
+		refs[v.Name()] = req
 	}
-	tmp, err := os.CreateTemp(filepath.Dir(pinsPath), ".pins-*")
+	if err := os.MkdirAll(filepath.Dir(pinsPath), 0750); err != nil {
+		return err
+	}
+	data, err := json.Marshal(refs)
 	if err != nil {
 		return err
 	}
-	defer os.Remove(tmp.Name())
-	if err := tmp.Close(); err != nil {
-		return err
-	}
-	if err := writeJSON(tmp.Name(), pins); err != nil {
-		return err
-	}
-	return os.Rename(tmp.Name(), pinsPath)
+	return os.WriteFile(pinsPath, data, 0644)
 }
 
-func (s objectSource) publish(ctx context.Context, p pin, data []byte) error {
+func (s objectSource) publish(ctx context.Context, key string, data []byte) error {
 	_, err := s.client.PutObject(ctx, &s3.PutObjectInput{
-		Bucket: aws.String(s.bucket), Key: aws.String(p.objectKey()),
+		Bucket: aws.String(s.bucket), Key: aws.String(key),
 		Body: bytes.NewReader(data), IfNoneMatch: aws.String("*"),
-		ContentType: aws.String("application/gzip"),
+		ContentType: aws.String("application/octet-stream"),
 	})
 	if err == nil {
 		return nil
 	}
 	var apiErr smithy.APIError
 	if !errors.As(err, &apiErr) || apiErr.ErrorCode() != "PreconditionFailed" {
-		return fmt.Errorf("publish %s: %w", p.objectKey(), err)
+		return fmt.Errorf("publish %s: %w", key, err)
 	}
-	body, err := s.open(ctx, p)
+	body, err := s.OpenObject(ctx, key)
 	if err != nil {
 		return err
 	}
 	defer body.Close()
-	if err := verifyFile(body, describe(data)); err != nil {
-		return fmt.Errorf("version %s already exists with different bytes: %w", p.Version, err)
+	existing, err := io.ReadAll(io.LimitReader(body, int64(len(data))+1))
+	if err != nil {
+		return err
+	}
+	if !bytes.Equal(existing, data) {
+		return fmt.Errorf("object %s already exists with different bytes", key)
 	}
 	return nil
+}
+
+// A local immutable object directory is useful for deterministic socket tests.
+type directorySource string
+
+func (s directorySource) OpenObject(ctx context.Context, key string) (io.ReadCloser, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	root, err := os.OpenRoot(string(s))
+	if err != nil {
+		return nil, err
+	}
+	defer root.Close()
+	return root.Open(key)
+}
+func configuredSource() (BundleSource, error) {
+	if root := os.Getenv("TC_OBJECT_ROOT"); root != "" {
+		return directorySource(root), nil
+	}
+	return newObjectSource()
 }

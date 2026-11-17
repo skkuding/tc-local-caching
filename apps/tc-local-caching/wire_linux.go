@@ -10,7 +10,6 @@ import (
 	"io"
 	"log"
 	"net"
-	"os"
 	"time"
 
 	"golang.org/x/sys/unix"
@@ -23,17 +22,22 @@ const (
 )
 
 type request struct {
-	Op  string   `json:"op"`
-	Pin pin      `json:"pin"`
-	IDs []string `json:"ids,omitempty"`
+	Op            string `json:"op"`
+	TestcaseSetID string `json:"testcaseSetId,omitempty"`
+	ManifestKey   string `json:"manifestKey,omitempty"`
+	Filter        string `json:"filter,omitempty"`
 }
-
+type caseMetadata struct {
+	ID          int     `json:"id"`
+	Hidden      bool    `json:"hidden"`
+	ScoreWeight float64 `json:"scoreWeight"`
+}
 type reply struct {
-	Error string      `json:"error,omitempty"`
-	Code  string      `json:"code,omitempty"`
-	Pin   pin         `json:"pin"`
-	IDs   []string    `json:"ids,omitempty"`
-	Stats *cacheStats `json:"stats,omitempty"`
+	Error         string         `json:"error,omitempty"`
+	Code          string         `json:"code,omitempty"`
+	TestcaseSetID string         `json:"testcaseSetId"`
+	Cases         []caseMetadata `json:"testcases"`
+	Stats         *cacheStats    `json:"stats,omitempty"`
 }
 
 func writePacket(conn *net.UnixConn, data []byte, fds []int) error {
@@ -52,6 +56,9 @@ func sendJSON(conn *net.UnixConn, value any) error {
 	data, err := json.Marshal(value)
 	if err != nil {
 		return err
+	}
+	if len(data) > maxPacket {
+		return errors.New("metadata packet too large")
 	}
 	return writePacket(conn, data, nil)
 }
@@ -160,17 +167,19 @@ func handle(ctx context.Context, conn *net.UnixConn, c *cache) {
 			_, _ = conn.Read(unused[:])
 			cancel()
 		}()
-			
+
 		// get from cache
-		result, err := c.acquire(ctx, req.Pin, req.IDs)
+		result, err := c.acquire(ctx, req)
 		if err != nil {
 			sendFailure(conn, err)
 			return
 		}
 		defer result.close()
-		if err := sendJSON(conn, reply{Pin: req.Pin, IDs: result.ids}); err != nil {
+		if err := sendJSON(conn, reply{TestcaseSetID: req.TestcaseSetID, Cases: result.cases}); err != nil {
 			return
 		}
+
+		// Deliver FDs in packets, with at most 64 descriptors per packet.
 		for start := 0; start < len(result.files); start += fdsPerPacket {
 			end := min(start+fdsPerPacket, len(result.files))
 			fds := make([]int, 0, end-start)
@@ -178,7 +187,7 @@ func handle(ctx context.Context, conn *net.UnixConn, c *cache) {
 				fds = append(fds, int(file.Fd()))
 			}
 			if err := writePacket(conn, []byte{1}, fds); err != nil {
-				log.Printf("transfer %s: %v", req.Pin.Version, err)
+				log.Printf("transfer %s: %v", req.TestcaseSetID, err)
 				return
 			}
 		}
@@ -219,41 +228,6 @@ func exchange(ctx context.Context, socket string, req request) (*net.UnixConn, r
 		return nil, reply{}, nil, fmt.Errorf("%s: %s", res.Code, res.Error)
 	}
 	return conn, res, closeConn, nil
-}
-
-func acquireFiles(ctx context.Context, socket string, p pin, ids []string) (acquired, error) {
-	conn, res, cleanup, err := exchange(ctx, socket, request{Op: "acquire", Pin: p, IDs: ids})
-	if err != nil {
-		return acquired{}, err
-	}
-	defer cleanup()
-	if res.Pin != p || len(res.IDs) == 0 || len(res.IDs) > maxCases {
-		return acquired{}, errors.New("invalid acquire response metadata")
-	}
-	if len(ids) != 0 && len(ids) != len(res.IDs) {
-		return acquired{}, errors.New("unexpected testcase count")
-	}
-	seen := make(map[string]bool, len(res.IDs))
-	for i, id := range res.IDs {
-		if !identifier.MatchString(id) || seen[id] || (len(ids) != 0 && id != ids[i]) {
-			return acquired{}, errors.New("invalid testcase-to-FD mapping")
-		}
-		seen[id] = true
-	}
-	result := acquired{ids: res.IDs, files: make([]*os.File, 0, 2*len(res.IDs))}
-	for len(result.files) < cap(result.files) {
-		expected := min(fdsPerPacket, cap(result.files)-len(result.files))
-		data, fds, err := readPacket(conn)
-		if err != nil || len(data) != 1 || data[0] != 1 || len(fds) != expected {
-			closeFDs(fds)
-			result.close()
-			return acquired{}, errors.Join(errors.New("incomplete FD response"), err)
-		}
-		for _, fd := range fds {
-			result.files = append(result.files, os.NewFile(uintptr(fd), "testcase"))
-		}
-	}
-	return result, nil
 }
 
 func queryStats(ctx context.Context, socket string) (cacheStats, error) {
